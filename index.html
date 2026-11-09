@@ -84,6 +84,8 @@
 
     /* ===== 게임 화면 ===== */
     .topbar { display: flex; justify-content: space-between; font-size: 20px; }
+    .voice-btn { font-size: 20px; padding: 6px 12px; border-radius: 999px; background: var(--card); box-shadow: 0 3px 0 var(--line); }
+    .voice-btn.off { opacity: .5; }
     .pill { background: var(--card); border-radius: 999px; padding: 6px 14px; box-shadow: 0 3px 0 var(--line); }
     .progress { height: 12px; background: #f3ead8; border-radius: 999px; overflow: hidden; }
     .progress > div { height: 100%; width: 0; background: var(--good); transition: width .3s; }
@@ -187,6 +189,14 @@
       </div>
     </div>
 
+    <div class="card">
+      <h2>③ 문제를 소리로 읽어 줄까요?</h2>
+      <div class="row" id="voiceButtons">
+        <button data-voice="on">🔊 읽어 주기</button>
+        <button data-voice="off">🔇 조용히</button>
+      </div>
+    </div>
+
     <p class="best" id="bestText"></p>
     <button class="big" id="startBtn">시작하기 ▶</button>
     <p class="hint" id="micSupportText"></p>
@@ -198,6 +208,7 @@
       <span class="pill" id="countText">1 / 10</span>
       <span class="pill" id="comboText">🔥 0</span>
       <span class="pill">⭐ <b id="scoreText">0</b>점</span>
+      <button class="voice-btn" id="voiceBtn" title="소리 켜기/끄기">🔊</button>
     </div>
     <div class="progress"><div id="progressBar"></div></div>
 
@@ -269,6 +280,7 @@ let typed = "";          // 숫자 패드로 입력 중인 값
 let questionStartTime = 0;
 let busy = false;        // 정답 표시 중일 때는 입력을 받지 않음
 let playing = false;
+let voiceOn = loadVoiceSetting(); // 문제를 소리로 읽어 줄지
 
 /* ===================== 1. 시작 화면 ===================== */
 
@@ -299,6 +311,24 @@ document.querySelectorAll("#countButtons button").forEach((btn) => {
   };
 });
 
+// 소리로 읽어 주기 켜기/끄기
+function loadVoiceSetting() {
+  try { return localStorage.getItem("gugudan-voice") !== "off"; } catch (e) { return true; }
+}
+function setVoice(on) {
+  voiceOn = on;
+  try { localStorage.setItem("gugudan-voice", on ? "on" : "off"); } catch (e) {}
+  document.querySelectorAll("#voiceButtons button").forEach((b) =>
+    b.classList.toggle("on", (b.dataset.voice === "on") === on));
+  $("voiceBtn").textContent = on ? "🔊" : "🔇";
+  $("voiceBtn").classList.toggle("off", !on);
+  if (!on) stopTalking();
+}
+document.querySelectorAll("#voiceButtons button").forEach((btn) => {
+  btn.onclick = () => { setVoice(btn.dataset.voice === "on"); if (voiceOn) { unlockSound(); speak("안녕! 같이 구구단 해요"); } };
+});
+$("voiceBtn").onclick = () => setVoice(!voiceOn);
+
 // 최고 점수 (이 컴퓨터/휴대폰에만 저장)
 function getBest() {
   try { return Number(localStorage.getItem("gugudan-best") || 0); } catch (e) { return 0; }
@@ -318,7 +348,7 @@ $("startBtn").onclick = () => {
 };
 $("againBtn").onclick = startGame;
 $("homeBtn").onclick = () => { showScreen("start"); showBest(); };
-$("quitBtn").onclick = () => { stopGame(); showScreen("start"); showBest(); };
+$("quitBtn").onclick = () => { stopTalking(); stopGame(); showScreen("start"); showBest(); };
 
 function showScreen(name) {
   Object.entries(screens).forEach(([key, el]) => el.classList.toggle("show", key === name));
@@ -366,6 +396,13 @@ function showQuestion() {
   busy = false;
   questionStartTime = performance.now();
   resetSpeechForNewQuestion();
+
+  // 문제를 소리로 읽어 주기: "칠 곱하기 팔은?"
+  // 빨리 맞히기 시간은 다 읽어 준 다음부터 잽니다
+  const thisQuestion = current;
+  speak(`${toSino(q.a)} 곱하기 ${toSino(q.b)}${josaEunNeun(q.b)}?`).then(() => {
+    if (thisQuestion === current && !busy) questionStartTime = performance.now();
+  });
 }
 
 function updateTopbar() {
@@ -418,8 +455,14 @@ function submitAnswer(value) {
   }
   updateTopbar();
 
-  // 틀렸을 땐 정답을 조금 더 오래 보여줌
-  setTimeout(nextQuestion, value === answer ? FEEDBACK_MS : FEEDBACK_MS + 1300);
+  // 소리로 알려 주기: 맞으면 "맞았어요!", 틀리면 "칠 팔 오십육" 처럼 정답을 외워 줌
+  const talk = value === answer
+    ? speak("맞았어요!")
+    : speak(`${toSino(q.a)} ${toSino(q.b)} ${toSino(answer)}`);
+  // 틀렸을 땐 정답을 조금 더 오래 보여줌. 말하는 게 끝날 때까지도 기다림
+  const wait = new Promise((r) => setTimeout(r, value === answer ? FEEDBACK_MS : FEEDBACK_MS + 1300));
+  const thisQuestion = current;
+  Promise.all([talk, wait]).then(() => { if (thisQuestion === current) nextQuestion(); });
 }
 
 function nextQuestion() {
@@ -457,6 +500,7 @@ function finishGame() {
   });
   $("wrongCard").style.display = wrongOnes.length ? "" : "none";
   showScreen("result");
+  speak(`다 풀었어요! ${correctCount}문제 맞혔어요. ${toSino(score)}점!`);
 }
 
 /* ===================== 3. 숫자 패드 & 키보드 ===================== */
@@ -510,7 +554,87 @@ function playSound(good) {
   } catch (e) {}
 }
 
-/* ===================== 5. 말로 답하기 (음성 인식) ===================== */
+/* ===================== 5. 소리로 읽어 주기 (음성 합성) ===================== */
+
+let talking = false;   // 지금 화면이 말하는 중인지
+let talkId = 0;        // 가장 최근 말하기 번호 (예전 말이 끝난 신호와 헷갈리지 않게)
+let koreanVoice = null;
+
+function pickKoreanVoice() {
+  if (!window.speechSynthesis) return;
+  const voices = speechSynthesis.getVoices();
+  koreanVoice = voices.find((v) => /^ko/i.test(v.lang)) || null;
+}
+if (window.speechSynthesis) {
+  pickKoreanVoice();
+  speechSynthesis.onvoiceschanged = pickKoreanVoice;
+}
+
+// 글자를 소리 내어 읽기. 다 읽으면 끝났다고 알려 줌(Promise)
+function speak(text) {
+  return new Promise((resolve) => {
+    if (!voiceOn || !window.speechSynthesis) { resolve(); return; }
+    const id = ++talkId;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ko-KR";
+    if (koreanVoice) u.voice = koreanVoice;
+    u.rate = 0.95;  // 아이들이 알아듣기 쉽게 살짝 천천히
+    u.pitch = 1.15; // 살짝 밝은 목소리
+    talking = true;
+    if (recognition) setMic(true, "🔊 잘 들어 보세요…");
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      // 스피커 소리가 마이크에 남아 있을 수 있어 아주 잠깐 더 기다림
+      setTimeout(() => {
+        if (id === talkId) {
+          talking = false;
+          ignoreBefore = lastResultCount; // 말하는 동안 들린 소리는 무시
+          if (recognition && playing && !busy) setMic(true, "듣고 있어요… 답을 말해 보세요!");
+        }
+        resolve();
+      }, 250);
+    };
+    u.onend = finish;
+    u.onerror = finish;
+    setTimeout(finish, 1500 + text.length * 250); // 끝났다는 신호가 안 오는 기기를 위한 안전장치
+    speechSynthesis.speak(u);
+  });
+}
+
+function stopTalking() {
+  talkId++;
+  talking = false;
+  if (window.speechSynthesis) speechSynthesis.cancel();
+}
+
+// 숫자를 한자어로 읽기: 56 → "오십육"
+function toSino(n) {
+  const d = ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
+  if (n === 0) return "영";
+  let out = "";
+  const hundreds = Math.floor(n / 100), tens = Math.floor((n % 100) / 10), ones = n % 10;
+  if (hundreds) out += (hundreds > 1 ? d[hundreds] : "") + "백";
+  if (tens) out += (tens > 1 ? d[tens] : "") + "십";
+  if (ones) out += d[ones];
+  return out;
+}
+// "팔은", "구는" 처럼 숫자 뒤에 붙는 말 고르기 (받침이 있으면 "은")
+function josaEunNeun(n) {
+  const last = toSino(n).slice(-1);
+  const hasBatchim = (last.charCodeAt(0) - 0xac00) % 28 !== 0;
+  return hasBatchim ? "은" : "는";
+}
+
+if (!window.speechSynthesis) {
+  document.querySelector("#voiceButtons").closest(".card").style.display = "none";
+  $("voiceBtn").style.display = "none";
+}
+setVoice(voiceOn);
+
+/* ===================== 6. 말로 답하기 (음성 인식) ===================== */
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
@@ -574,7 +698,7 @@ function resetSpeechForNewQuestion() {
 
 function handleSpeech(event) {
   lastResultCount = event.results.length;
-  if (busy || !playing) return;
+  if (busy || !playing || talking) return; // 화면이 말하는 소리를 아이 답으로 착각하지 않게
 
   const q = questions[current];
   const answer = q.a * q.b;
