@@ -378,7 +378,6 @@ function startGame() {
   showScreen("game");
   updateTopbar();
   showQuestion();
-  startListening();
 }
 
 function stopGame() {
@@ -395,7 +394,8 @@ function showQuestion() {
   $("message").className = "message";
   busy = false;
   questionStartTime = performance.now();
-  resetSpeechForNewQuestion();
+  clearTimeout(matchTimer);
+  if (SpeechRecognition && !micBlocked) setMic(false, "준비…");
 
   // 문제를 소리로 읽어 주기: "칠 곱하기 팔은?"
   // 빨리 맞히기 시간은 다 읽어 준 다음부터 잽니다
@@ -403,6 +403,7 @@ function showQuestion() {
   speak(`${toSino(q.a)} 곱하기 ${toSino(q.b)}${josaEunNeun(q.b)}?`).then(() => {
     if (thisQuestion === current && !busy) questionStartTime = performance.now();
   });
+  syncMic(); // 소리 끄기 상태면 바로 마이크 켜기 (읽어 주는 중이면 다 읽은 뒤에 켜짐)
 }
 
 function updateTopbar() {
@@ -416,6 +417,8 @@ function updateTopbar() {
 function submitAnswer(value) {
   if (busy || !playing) return;
   busy = true;
+  clearTimeout(matchTimer);
+  syncMic(); // 채점하는 동안 마이크 끄기
   const q = questions[current];
   const answer = q.a * q.b;
   const seconds = (performance.now() - questionStartTime) / 1000;
@@ -582,7 +585,8 @@ function speak(text) {
     u.rate = 0.95;  // 아이들이 알아듣기 쉽게 살짝 천천히
     u.pitch = 1.15; // 살짝 밝은 목소리
     talking = true;
-    if (recognition) setMic(true, "🔊 잘 들어 보세요…");
+    syncMic(); // 말하는 동안에는 마이크 끄기 (내 목소리를 답으로 착각하지 않게)
+    if (playing && !busy) setMic(false, "🔊 잘 들어 보세요…");
     let done = false;
     const finish = () => {
       if (done) return;
@@ -591,8 +595,7 @@ function speak(text) {
       setTimeout(() => {
         if (id === talkId) {
           talking = false;
-          ignoreBefore = lastResultCount; // 말하는 동안 들린 소리는 무시
-          if (recognition && playing && !busy) setMic(true, "듣고 있어요… 답을 말해 보세요!");
+          syncMic(); // 다 말했으면 마이크 켜기
         }
         resolve();
       }, 250);
@@ -608,6 +611,7 @@ function stopTalking() {
   talkId++;
   talking = false;
   if (window.speechSynthesis) speechSynthesis.cancel();
+  if (typeof syncMic === "function" && playing) syncMic();
 }
 
 // 숫자를 한자어로 읽기: 56 → "오십육"
@@ -636,11 +640,19 @@ setVoice(voiceOn);
 
 /* ===================== 6. 말로 답하기 (음성 인식) ===================== */
 
+/* 동작 방식 (간단하게!)
+   - 문제를 다 읽어 준 다음 마이크를 "새로" 켭니다.
+   - 답이 들리면 채점하고, 정답을 알려 주는 동안에는 마이크를 끕니다.
+   - 다음 문제가 나오면 다시 새로 켭니다.
+   이렇게 문제마다 새로 켜야 휴대폰(특히 안드로이드)에서도 이전 문제의 말과 섞이지 않아요. */
+
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
-let listening = false;
-let ignoreBefore = 0;      // 이전 문제 때 들린 말은 무시하기 위한 번호
-let lastResultCount = 0;
+let micActive = false;     // 마이크가 켜져 있거나 켜지는 중인지
+let micBlocked = false;    // 사용자가 마이크를 막았는지
+let micQuestion = -1;      // 지금 켜진 마이크가 몇 번째 문제용인지
+let micRetryTimer = null;
+let lastMicError = null;
 let matchTimer = null;
 
 if (!SpeechRecognition) {
@@ -653,58 +665,74 @@ function setMic(on, text) {
   $("micText").innerHTML = text;
 }
 
-function startListening() {
-  if (!SpeechRecognition) { setMic(false, "🎹 숫자 버튼을 눌러 답해요"); return; }
-  if (recognition) return;
-  recognition = new SpeechRecognition();
-  recognition.lang = "ko-KR";
-  recognition.continuous = true;      // 계속 듣기
-  recognition.interimResults = true;  // 말하는 중간에도 결과 받기 → 더 빠른 채점
-  recognition.maxAlternatives = 5;    // 비슷하게 들린 후보도 같이 받기
+// 지금 마이크를 켜 둬야 하는 때인지
+function shouldListen() {
+  return playing && !busy && !talking && !micBlocked && !!SpeechRecognition;
+}
 
-  recognition.onstart = () => { listening = true; setMic(true, "듣고 있어요… 답을 말해 보세요!"); };
-  recognition.onresult = handleSpeech;
-  recognition.onerror = (e) => {
+function makeRecognition() {
+  const r = new SpeechRecognition();
+  r.lang = "ko-KR";
+  r.continuous = false;      // 한 번 말하면 끝 → 문제마다 새로 켜서 깔끔하게
+  r.interimResults = true;   // 말하는 중간에도 결과 받기 → 더 빠른 채점
+  r.maxAlternatives = 5;     // 비슷하게 들린 후보도 같이 받기
+  r.onstart = () => {
+    if (shouldListen()) setMic(true, "듣고 있어요… 답을 말해 보세요!");
+  };
+  r.onresult = handleSpeech;
+  r.onerror = (e) => {
+    lastMicError = e.error;
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      micBlocked = true;
       setMic(false, "🙅 마이크 사용이 막혀 있어요. 숫자 버튼으로 답해 주세요.");
-      recognition = null;
     }
   };
-  recognition.onend = () => {
-    listening = false;
-    // 크롬은 조용하면 저절로 듣기를 멈추기 때문에, 게임 중이면 다시 켭니다
-    if (playing && recognition) {
-      lastResultCount = 0; ignoreBefore = 0;
-      try { recognition.start(); } catch (e) {}
-    }
+  r.onend = () => {
+    micActive = false;
+    // 아직 답을 기다리는 중이면 (조용해서 저절로 꺼진 경우 등) 다시 켜기
+    // (마이크 오류가 났을 땐 조금 쉬었다가 다시 켜기)
+    const trouble = lastMicError && lastMicError !== "no-speech" && lastMicError !== "aborted";
+    lastMicError = null;
+    clearTimeout(micRetryTimer);
+    micRetryTimer = setTimeout(syncMic, trouble ? 1000 : 150);
   };
-  try { recognition.start(); } catch (e) {}
+  return r;
+}
+
+// 상황에 맞게 마이크를 켜거나 끄기
+function syncMic() {
+  if (!SpeechRecognition) {
+    if (playing) setMic(false, "🎹 숫자 버튼을 눌러 답해요");
+    return;
+  }
+  if (shouldListen()) {
+    // 이전 문제용으로 켜진 마이크면 끄고 새로 켜기 (끝나면 onend에서 다시 이 함수가 불림)
+    if (micActive && micQuestion !== current) { try { recognition.abort(); } catch (e) {} return; }
+    if (micActive) return;
+    if (!recognition) recognition = makeRecognition();
+    micQuestion = current;
+    micActive = true;
+    try { recognition.start(); } catch (e) { micActive = false; }
+  } else if (micActive) {
+    try { recognition.abort(); } catch (e) {}
+  }
 }
 
 function stopListening() {
   clearTimeout(matchTimer);
-  if (recognition) {
-    const r = recognition;
-    recognition = null;
-    try { r.stop(); } catch (e) {}
-  }
+  clearTimeout(micRetryTimer);
+  if (recognition && micActive) { try { recognition.abort(); } catch (e) {} }
   setMic(false, "");
 }
 
-function resetSpeechForNewQuestion() {
-  clearTimeout(matchTimer);
-  ignoreBefore = lastResultCount; // 지금까지 들린 말은 이전 문제 것이므로 무시
-}
-
 function handleSpeech(event) {
-  lastResultCount = event.results.length;
-  if (busy || !playing || talking) return; // 화면이 말하는 소리를 아이 답으로 착각하지 않게
+  // 이전 문제용 마이크에서 온 말, 채점 중이거나 화면이 말하는 중에 들린 말은 무시
+  if (!shouldListen() || micQuestion !== current) return;
 
   const q = questions[current];
   const answer = q.a * q.b;
 
-  // 이번 문제가 나온 뒤에 들린 말만 모으기
-  for (let i = Math.max(event.resultIndex, ignoreBefore); i < event.results.length; i++) {
+  for (let i = event.resultIndex; i < event.results.length; i++) {
     const result = event.results[i];
     const heardTexts = [];
     for (let k = 0; k < result.length; k++) heardTexts.push(result[k].transcript);
@@ -719,7 +747,8 @@ function handleSpeech(event) {
       // (예: 정답이 20인데 "이십일"이라고 말하는 중일 수 있어서)
       clearTimeout(matchTimer);
       if (result.isFinal) { submitAnswer(answer); return; }
-      matchTimer = setTimeout(() => submitAnswer(answer), 350);
+      const q0 = current;
+      matchTimer = setTimeout(() => { if (q0 === current) submitAnswer(answer); }, 350);
       return;
     }
     clearTimeout(matchTimer);
