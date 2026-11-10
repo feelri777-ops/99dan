@@ -5,15 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
   <title>구구단 놀이</title>
   <script>
-    // 위스퍼 AI를 고른 경우에만: 휴대폰 CPU 여러 개를 함께 쓰도록 보안 설정을 켜는 도우미
-    // (켜면 위스퍼가 더 빨라져요. 구글 모드에서는 아무것도 안 해요)
-    window.coi = {
-      shouldRegister: () => { try { return localStorage.getItem("gugudan-engine") === "whisper"; } catch (e) { return false; } },
-      coepCredentialless: () => true, // 구글 글꼴 같은 바깥 파일도 막지 않는 방식
-      quiet: true,
-    };
+    // 예전 위스퍼 버전이 설치한 도우미(서비스 워커)가 남아 있으면 지워요
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.getRegistrations().then((rs) => rs.forEach((r) => r.unregister())).catch(() => {});
+    }
   </script>
-  <script src="coi-serviceworker.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jua&display=swap" />
   <style>
@@ -189,11 +185,11 @@
     #learnDoneBtns { display: flex; flex-direction: column; gap: 10px; }
     .back-btn { font-size: 18px; padding: 6px 12px; border-radius: 999px; background: var(--card); box-shadow: 0 3px 0 var(--line); }
 
-    /* ===== 말 알아듣는 방법 (위스퍼) ===== */
+    /* ===== 말 알아듣는 방법 (보스크) ===== */
     .engine-note { font-size: 16px; color: var(--sub); margin: 10px 2px 0; line-height: 1.4; }
-    .whisper-status { margin-top: 10px; font-size: 18px; }
-    .whisper-bar { height: 10px; background: #f3ead8; border-radius: 999px; overflow: hidden; margin-top: 6px; }
-    .whisper-bar > div { height: 100%; width: 0; background: var(--sky); transition: width .2s; }
+    .vosk-status { margin-top: 10px; font-size: 18px; }
+    .vosk-bar { height: 10px; background: #f3ead8; border-radius: 999px; overflow: hidden; margin-top: 6px; }
+    .vosk-bar > div { height: 100%; width: 0; background: var(--sky); transition: width .2s; }
 
     /* ===== 결과 화면 ===== */
     .stars { text-align: center; font-size: 64px; letter-spacing: 6px; }
@@ -243,15 +239,11 @@
       <h2>④ 말은 누가 알아들을까요?</h2>
       <div class="row" id="engineButtons">
         <button data-engine="google">🌐 구글</button>
-        <button data-engine="whisper">🧠 위스퍼 AI</button>
+        <button data-engine="vosk">🎯 보스크 AI</button>
       </div>
-      <div id="whisperBox" hidden>
-        <div class="row" id="whisperSizeButtons" style="margin-top:10px">
-          <button data-size="tiny">가볍게 (41MB)</button>
-          <button data-size="base">똑똑하게 (77MB)</button>
-        </div>
-        <div class="whisper-status" id="whisperStatus"></div>
-        <div class="whisper-bar" id="whisperBarWrap" hidden><div id="whisperBar"></div></div>
+      <div id="voskBox" hidden>
+        <div class="vosk-status" id="voskStatus"></div>
+        <div class="vosk-bar" id="voskBarWrap" hidden><div id="voskBar"></div></div>
       </div>
       <p class="engine-note" id="engineNote"></p>
     </div>
@@ -958,7 +950,7 @@ let listenSeq = 0;
 
 if (!SpeechRecognition) {
   $("micSupportText").textContent =
-    "⚠️ 이 브라우저는 구글 말 알아듣기를 지원하지 않아요. ④에서 위스퍼 AI를 고르거나 숫자 버튼으로 답해 주세요.";
+    "⚠️ 이 브라우저는 구글 말 알아듣기를 지원하지 않아요. ④에서 보스크 AI를 고르거나 숫자 버튼으로 답해 주세요.";
 }
 
 // 마이크 상태 글자 바꾸기 (게임 화면, 외우기 화면 모두)
@@ -984,7 +976,7 @@ function stopListen() {
 // 지금 마이크를 켜 둬야 하는 때인지
 function shouldListen() {
   if (!listenFor || talking || micBlocked) return false;
-  return speechEngine === "whisper" ? whisperReady : !!SpeechRecognition;
+  return speechEngine === "vosk" ? voskReady : !!SpeechRecognition;
 }
 
 function makeRecognition() {
@@ -1018,7 +1010,7 @@ function makeRecognition() {
 
 // 상황에 맞게 마이크를 켜거나 끄기
 function syncMic() {
-  if (speechEngine === "whisper") { syncWhisperMic(); return; }
+  if (speechEngine === "vosk") { syncVoskMic(); return; }
   if (!SpeechRecognition) {
     if (listenFor) setMic(false, learnActive ? "👉 다 따라 했으면 [다음 ▶]을 눌러요" : "🎹 숫자 버튼을 눌러 답해요");
     return;
@@ -1041,7 +1033,7 @@ function stopListening() {
   clearTimeout(micRetryTimer);
   listenFor = null;
   if (recognition && micActive) { try { recognition.abort(); } catch (e) {} }
-  releaseWhisperMic();
+  releaseVoskMic();
   setMic(false, "");
 }
 
@@ -1059,14 +1051,15 @@ function handleSpeech(event) {
   }
 }
 
-// 들린 말(구글이든 위스퍼든)을 채점하는 곳으로 넘기기
-function deliverHeard(target, heardTexts, isFinal) {
+// 들린 말(구글이든 보스크든)을 채점하는 곳으로 넘기기
+// unclear 가 true 면 "자신 없게 들렸어요" → 채점하지 않고 다시 물어봐요
+function deliverHeard(target, heardTexts, isFinal, unclear = false) {
   const shown = (heardTexts[0] || "").trim();
   if (shown) setMic(true, `들린 말: <span class="heard">"${escapeHtml(shown)}"</span>`);
   const candidates = new Set();
-  heardTexts.forEach((t) => parseKoreanNumbers(t).forEach((n) => candidates.add(n)));
+  if (!unclear) heardTexts.forEach((t) => parseKoreanNumbers(t).forEach((n) => candidates.add(n)));
   const first = parseKoreanNumbers(heardTexts[0] || "")[0];
-  target.handler({ candidates, texts: heardTexts, isFinal, first: first != null ? first : [...candidates][0] });
+  target.handler({ candidates, texts: heardTexts, isFinal, unclear, first: first != null ? first : [...candidates][0] });
 }
 
 // 들린 말을 채점하는 도우미
@@ -1075,6 +1068,7 @@ function deliverHeard(target, heardTexts, isFinal) {
 //  extraTargets: 정답 말고도 맞다고 볼 소리 (예: 외우기 모드의 "칠이십사")
 function judge(info, answer, onRight, onWrong, onUnclear, extraTargets = [], q = null) {
   const id = listenFor && listenFor.id;
+  if (info.unclear) { if (onUnclear) onUnclear(); return; }
   if (info.candidates.has(answer)) {
     // 정답이 들렸어요! 말이 아직 이어지는 중일 수 있으니 아주 잠깐만 기다렸다가 채점
     // (예: 정답이 20인데 "이십일"이라고 말하는 중일 수 있어서)
@@ -1244,24 +1238,22 @@ function quizHeard(info) {
 }
 let unclearCount = 0;
 
-/* ===================== 7. 위스퍼 AI (휴대폰 안에서 알아듣기) ===================== */
-/* 구글 대신 "위스퍼(Whisper)"라는 AI를 휴대폰 브라우저 안에서 직접 돌려요.
-   - 처음 한 번 AI 파일을 내려받아요 (가볍게 41MB / 똑똑하게 77MB). 그다음부터는 저장돼 있어서 빨라요.
+/* ===================== 7. 보스크 AI (휴대폰 안에서 알아듣기) ===================== */
+/* 구글 대신 "보스크(Vosk)"라는 음성 인식 AI를 휴대폰 브라우저 안에서 직접 돌려요.
+   - 처음 한 번 한국어 AI 파일(87MB)을 내려받아요. 그다음부터는 휴대폰에 저장돼 있어서 빨라요.
    - 아이 목소리가 휴대폰 밖으로 나가지 않아요.
-   흐름: 마이크 소리를 계속 듣다가 → 말소리가 시작되면 녹음 → 조용해지면 녹음 끝
-         → 위스퍼에게 "뭐라고 했어?" 물어보기 → 받아 적은 글자를 채점 */
+   - ⭐ "숫자 말고는 듣지 마" 라고 정해 둘 수 있어서, 엉뚱한 글자로 받아 적지 않아요. */
 
-const WHISPER_MODELS = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base" };
-const TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5";
-let speechEngine = loadPref("gugudan-engine", "google");   // "google" 또는 "whisper"
-let whisperSize = loadPref("gugudan-whisper-size", "base"); // "tiny" 또는 "base"
-let whisperWorker = null;
-let whisperReady = false;
-let whisperLoadedSize = null;
-let whisperPercent = 0;
-let whisperError = "";
-let whisperJobId = 0;
-const whisperJobs = new Map();
+const VOSK_SCRIPT = "https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js";
+const VOSK_MODEL = new URL("models/vosk-model-ko.tar.gz", location.href).href;
+let speechEngine = loadPref("gugudan-engine", "google"); // "google" 또는 "vosk"
+if (speechEngine === "whisper") speechEngine = "vosk";     // 예전 위스퍼 설정은 보스크로
+let voskModel = null;
+let voskReady = false;
+let voskLoading = false;
+let voskStage = "";      // 지금 하는 일 (받는 중 / 푸는 중)
+let voskPercent = 0;
+let voskError = "";
 
 function loadPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; }
@@ -1270,145 +1262,119 @@ function savePref(key, value) {
   try { localStorage.setItem(key, value); } catch (e) {}
 }
 
-// 위스퍼는 무거워서 화면이 멈추지 않도록 "일꾼(Web Worker)"에게 따로 시켜요
-const WHISPER_WORKER_CODE = `
-import { pipeline, env } from "${TRANSFORMERS_URL}";
-env.allowLocalModels = false;
-let asr = null;
-const files = {};
-self.onmessage = async (e) => {
-  const m = e.data;
-  if (m.type === "load") {
-    try {
-      asr = await pipeline("automatic-speech-recognition", m.model, {
-        dtype: "q8",
-        device: "wasm",
-        progress_callback: (p) => {
-          if (p.status === "progress" && p.total) {
-            files[p.file] = [p.loaded, p.total];
-            let a = 0, b = 0;
-            for (const k in files) { a += files[k][0]; b += files[k][1]; }
-            self.postMessage({ type: "progress", percent: Math.floor((a / b) * 100) });
-          }
-        },
-      });
-      // 첫 번째는 느려서 미리 한 번 연습 삼아 돌려 두기
-      await asr(new Float32Array(16000), { language: "korean", task: "transcribe" });
-      self.postMessage({ type: "ready" });
-    } catch (err) {
-      self.postMessage({ type: "error", message: String((err && err.message) || err) });
-    }
-  } else if (m.type === "run") {
-    try {
-      const t0 = performance.now();
-      // 답은 짧으니 조금만 받아 적게 해요 (같은 말을 끝없이 반복하는 실수 막기)
-      const out = await asr(m.audio, { language: "korean", task: "transcribe", max_new_tokens: 12 });
-      self.postMessage({ type: "result", id: m.id, text: (out && out.text) || "", ms: Math.round(performance.now() - t0) });
-    } catch (err) {
-      self.postMessage({ type: "result", id: m.id, text: "", error: String(err) });
-    }
+// 보스크 한국어 사전에 있는 숫자 낱말들 (이 낱말들만 알아들어요)
+// "오십육" 은 사전에 없어서 "오십 육" 처럼 나눠서 들어요
+const VOSK_WORDS = new Set(["구", "구십", "구십구", "넷", "다섯", "둘", "마흔", "사", "사십", "사십구", "사십오",
+  "사십팔", "삼", "삼십", "삼십오", "삼십육", "삼십칠", "삼십팔", "서른", "셋", "쉰", "스물", "십", "십구", "십사", "십삼",
+  "십오", "십육", "십이", "십일", "십칠", "십팔", "아홉", "아흔", "여덟", "여든", "여섯", "열", "영", "예순", "오", "오십",
+  "육", "육십", "이", "이십", "이십사", "이십삼", "이십오", "이십일", "일", "일곱", "일흔", "칠", "칠십", "팔", "팔십",
+  "팔십팔", "하나"]);
+function voskGrammar() {
+  const d = ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"];
+  const phrases = new Set(VOSK_WORDS);
+  for (let n = 1; n <= 90; n++) {
+    const t = Math.floor(n / 10), u = n % 10;
+    if (VOSK_WORDS.has(toSino(n))) continue;
+    const tens = (t > 1 ? d[t] : "") + "십";
+    if (t && u && VOSK_WORDS.has(tens)) phrases.add(`${tens} ${d[u]}`);         // "오십 육"
+    if (t > 1 && u && VOSK_WORDS.has("십" + d[u])) phrases.add(`${d[t]} 십${d[u]}`); // "오 십육"
   }
-};`;
-
-function loadWhisper() {
-  if (whisperWorker && whisperLoadedSize === whisperSize) return;
-  if (whisperWorker) { whisperWorker.terminate(); whisperWorker = null; }
-  whisperReady = false;
-  whisperError = "";
-  whisperPercent = 0;
-  whisperLoadedSize = whisperSize;
-  try {
-    const url = URL.createObjectURL(new Blob([WHISPER_WORKER_CODE], { type: "text/javascript" }));
-    whisperWorker = new Worker(url, { type: "module" });
-  } catch (e) {
-    whisperError = "이 브라우저에서는 위스퍼를 쓸 수 없어요";
-    updateEngineUI();
-    return;
-  }
-  whisperWorker.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === "progress") { whisperPercent = m.percent; updateEngineUI(); }
-    else if (m.type === "ready") { whisperReady = true; updateEngineUI(); syncMic(); }
-    else if (m.type === "error") { whisperError = m.message; updateEngineUI(); }
-    else if (m.type === "result") {
-      const job = whisperJobs.get(m.id);
-      whisperJobs.delete(m.id);
-      if (job) job(m);
-    }
-  };
-  whisperWorker.onerror = () => { whisperError = "위스퍼를 불러오지 못했어요 (인터넷 확인)"; updateEngineUI(); };
-  whisperWorker.postMessage({ type: "load", model: WHISPER_MODELS[whisperSize] });
-  updateEngineUI();
+  return JSON.stringify([...phrases]);
 }
 
-function whisperTranscribe(audio16k) {
-  return new Promise((resolve) => {
-    const id = ++whisperJobId;
-    whisperJobs.set(id, resolve);
-    whisperWorker.postMessage({ type: "run", id, audio: audio16k }, [audio16k.buffer]);
+// 보스크 프로그램(vosk.js) 불러오기
+function loadVoskScript() {
+  if (window.Vosk) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = VOSK_SCRIPT;
+    sc.onload = resolve;
+    sc.onerror = () => reject(new Error("보스크 프로그램을 받지 못했어요 (인터넷 확인)"));
+    document.head.appendChild(sc);
   });
 }
 
-function whisperStatusText() {
-  if (whisperError) return "😢 " + whisperError;
-  if (whisperReady) return "✅ 위스퍼 준비 완료! (휴대폰 안에서 알아들어요)";
-  return `🧠 위스퍼 AI 받는 중… ${whisperPercent}% (처음 한 번만 받아요)`;
+// 처음 한 번은 AI 파일을 직접 받아서 몇 % 받았는지 보여 줘요
+async function prefetchVoskModel() {
+  if (loadPref("gugudan-vosk-saved", "") === "1") return; // 이미 휴대폰에 저장돼 있음
+  const res = await fetch(VOSK_MODEL);
+  if (!res.ok || !res.body) throw new Error("AI 파일을 받지 못했어요 (인터넷 확인)");
+  const total = Number(res.headers.get("content-length")) || 86916645;
+  const reader = res.body.getReader();
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    got += value.length;
+    const p = Math.min(99, Math.floor((got / total) * 100));
+    if (p !== voskPercent) { voskPercent = p; updateEngineUI(); }
+  }
+}
+
+async function loadVosk() {
+  if (voskReady || voskLoading) return;
+  voskLoading = true;
+  voskError = "";
+  voskPercent = 0;
+  try {
+    voskStage = "download";
+    updateEngineUI();
+    await loadVoskScript();
+    await prefetchVoskModel();
+    voskStage = "unpack";
+    updateEngineUI();
+    // 압축을 풀고 준비하기 (너무 오래 걸리면 저장 공간 문제일 수 있어요)
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error(
+      "준비가 너무 오래 걸려요. 시크릿 창이면 일반 창에서 열어 주세요 (저장 공간 필요)")), 120000));
+    voskModel = await Promise.race([Vosk.createModel(VOSK_MODEL), timeout]);
+    voskReady = true;
+    savePref("gugudan-vosk-saved", "1");
+  } catch (e) {
+    voskError = (e && e.message) || String(e);
+  }
+  voskLoading = false;
+  updateEngineUI();
+  syncMic();
+}
+
+function voskStatusText() {
+  if (voskError) return "😢 " + voskError;
+  if (voskReady) return "✅ 보스크 준비 완료! (휴대폰 안에서 알아들어요)";
+  if (voskStage === "unpack") return "📦 AI 준비 중… (잠깐만 기다려요)";
+  return `🎯 보스크 AI 받는 중… ${voskPercent}% (87MB, 처음 한 번만)`;
 }
 
 // 시작 화면의 ④번 카드 모양 바꾸기
 function updateEngineUI() {
   document.querySelectorAll("#engineButtons button").forEach((b) => b.classList.toggle("on", b.dataset.engine === speechEngine));
-  document.querySelectorAll("#whisperSizeButtons button").forEach((b) => b.classList.toggle("on", b.dataset.size === whisperSize));
-  $("whisperBox").hidden = speechEngine !== "whisper";
-  $("whisperStatus").textContent = whisperStatusText();
-  $("whisperBarWrap").hidden = whisperReady || !!whisperError;
-  $("whisperBar").style.width = whisperPercent + "%";
-  $("engineNote").textContent = speechEngine === "whisper"
-    ? "휴대폰 안의 AI가 들어요. 목소리가 밖으로 나가지 않아요. 대신 알아듣는 데 1~3초 걸려요. (가볍게: 빠름 / 똑똑하게: 더 정확)"
-    : "구글이 들어요. 빠르지만 인터넷이 필요하고, 목소리가 구글로 보내져요.";
-  if (speechEngine === "whisper" && !whisperReady && listenFor) setMic(false, whisperStatusText());
+  $("voskBox").hidden = speechEngine !== "vosk";
+  $("voskStatus").textContent = voskStatusText();
+  $("voskBarWrap").hidden = voskReady || !!voskError || voskStage === "unpack";
+  $("voskBar").style.width = voskPercent + "%";
+  $("engineNote").textContent = speechEngine === "vosk"
+    ? "휴대폰 안의 AI가 숫자만 골라 들어요. 목소리가 밖으로 나가지 않아요. 처음 한 번 87MB를 받으니 와이파이에서 켜 주세요."
+    : "구글이 들어요. 바로 쓸 수 있지만 인터넷이 필요하고, 목소리가 구글로 보내져요.";
+  if (speechEngine === "vosk" && !voskReady && listenFor) setMic(false, voskStatusText());
 }
 
 document.querySelectorAll("#engineButtons button").forEach((btn) => {
   btn.onclick = () => {
     speechEngine = btn.dataset.engine;
     savePref("gugudan-engine", speechEngine);
-    // 위스퍼를 처음 고르면 빠르게 돌리는 설정을 켜기 위해 화면을 한 번 새로 고쳐요
-    if (speechEngine === "whisper" && window.crossOriginIsolated === false && window.isSecureContext && navigator.serviceWorker) {
-      $("whisperBox").hidden = false;
-      $("whisperStatus").textContent = "🔄 위스퍼 준비를 위해 화면을 새로 고칠게요…";
-      setTimeout(() => location.reload(), 400);
-      return;
-    }
-    if (speechEngine === "whisper") loadWhisper();
-    updateEngineUI();
-  };
-});
-document.querySelectorAll("#whisperSizeButtons button").forEach((btn) => {
-  btn.onclick = () => {
-    whisperSize = btn.dataset.size;
-    savePref("gugudan-whisper-size", whisperSize);
-    loadWhisper();
+    if (speechEngine === "vosk") loadVosk();
     updateEngineUI();
   };
 });
 
-/* ----- 위스퍼용 마이크: 말소리가 시작되고 끝나는 걸 스스로 알아내요 ----- */
-const wMic = {
-  stream: null, ctx: null, src: null, node: null,
-  armed: false,      // 지금 말을 기다리는 중인지
-  forId: -1,         // 어떤 "듣기"용인지
-  thinking: false,   // 위스퍼가 알아듣는 중인지
-  inSpeech: false, chunks: [], pre: [], speechMs: 0, silenceMs: 0, floor: 0.01,
-  opening: null,
-};
+/* ----- 보스크용 마이크 ----- */
+const vMic = { stream: null, ctx: null, src: null, node: null, rec: null, forId: -1, opening: null };
 
-async function openWhisperMic() {
-  if (wMic.stream) return true;
-  if (wMic.opening) return wMic.opening;
-  wMic.opening = (async () => {
+async function openVoskMic() {
+  if (vMic.stream) return true;
+  if (vMic.opening) return vMic.opening;
+  vMic.opening = (async () => {
     try {
-      wMic.stream = await navigator.mediaDevices.getUserMedia({
+      vMic.stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
     } catch (e) {
@@ -1416,127 +1382,76 @@ async function openWhisperMic() {
       setMic(false, "🙅 마이크 사용이 막혀 있어요. 버튼으로 해 주세요.");
       return false;
     } finally {
-      wMic.opening = null;
+      vMic.opening = null;
     }
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    wMic.ctx = new Ctx();
-    if (wMic.ctx.state === "suspended") { try { await wMic.ctx.resume(); } catch (e) {} }
-    wMic.src = wMic.ctx.createMediaStreamSource(wMic.stream);
-    wMic.node = wMic.ctx.createScriptProcessor(2048, 1, 1);
-    wMic.node.onaudioprocess = onWhisperAudio;
-    wMic.src.connect(wMic.node);
-    wMic.node.connect(wMic.ctx.destination); // 소리는 내보내지 않아요 (빈 소리)
+    vMic.ctx = new Ctx();
+    if (vMic.ctx.state === "suspended") { try { await vMic.ctx.resume(); } catch (e) {} }
+    vMic.src = vMic.ctx.createMediaStreamSource(vMic.stream);
+    vMic.node = vMic.ctx.createScriptProcessor(4096, 1, 1);
+    // 답을 기다리는 동안에만 소리를 보스크에게 넘겨요
+    vMic.node.onaudioprocess = (e) => {
+      if (vMic.rec && shouldListen() && listenFor.id === vMic.forId) {
+        try { vMic.rec.acceptWaveform(e.inputBuffer); } catch (err) {}
+      }
+    };
+    vMic.src.connect(vMic.node);
+    vMic.node.connect(vMic.ctx.destination); // 소리는 내보내지 않아요 (빈 소리)
     return true;
   })();
-  return wMic.opening;
+  return vMic.opening;
 }
 
-function releaseWhisperMic() {
-  wMic.armed = false;
-  wMic.inSpeech = false;
-  if (wMic.stream) {
-    try { wMic.node.disconnect(); wMic.src.disconnect(); } catch (e) {}
-    wMic.stream.getTracks().forEach((t) => t.stop());
-    try { wMic.ctx.close(); } catch (e) {}
-    wMic.stream = wMic.ctx = wMic.src = wMic.node = null;
+function dropVoskRecognizer() {
+  if (vMic.rec) { try { vMic.rec.remove(); } catch (e) {} vMic.rec = null; }
+  vMic.forId = -1;
+}
+
+function releaseVoskMic() {
+  dropVoskRecognizer();
+  if (vMic.stream) {
+    try { vMic.node.disconnect(); vMic.src.disconnect(); } catch (e) {}
+    vMic.stream.getTracks().forEach((t) => t.stop());
+    try { vMic.ctx.close(); } catch (e) {}
+    vMic.stream = vMic.ctx = vMic.src = vMic.node = null;
   }
 }
 
-function syncWhisperMic() {
-  if (!listenFor) { wMic.armed = false; wMic.inSpeech = false; return; }
-  if (!whisperReady) { setMic(false, whisperStatusText()); if (!whisperWorker) loadWhisper(); return; }
-  if (!shouldListen() || wMic.thinking) { wMic.armed = false; wMic.inSpeech = false; return; }
+function syncVoskMic() {
+  if (!listenFor) { dropVoskRecognizer(); return; }
+  if (!voskReady) { setMic(false, voskStatusText()); if (!voskLoading && !voskError) loadVosk(); return; }
+  if (!shouldListen()) { dropVoskRecognizer(); return; }
   const id = listenFor.id;
-  openWhisperMic().then((ok) => {
-    if (!ok || !listenFor || listenFor.id !== id || !shouldListen() || wMic.thinking) return;
-    if (!wMic.armed || wMic.forId !== id) {
-      wMic.armed = true;
-      wMic.forId = id;
-      wMic.inSpeech = false;
-      setMic(true, listenFor.prompt);
-    }
+  openVoskMic().then((ok) => {
+    if (!ok || !listenFor || listenFor.id !== id || !shouldListen()) return;
+    if (vMic.rec && vMic.forId === id) return;
+    // 새 문제(새 "듣기")마다 새 귀를 만들어서 이전 말과 섞이지 않게 해요
+    dropVoskRecognizer();
+    const rec = new voskModel.KaldiRecognizer(vMic.ctx.sampleRate, voskGrammar());
+    rec.setWords(true);
+    rec.on("result", (m) => {
+      if (vMic.rec !== rec || !listenFor || listenFor.id !== id) return;
+      const r = m.result || {};
+      const text = (r.text || "").trim();
+      if (!text) return; // 조용했어요
+      const words = r.result || [];
+      const conf = words.length ? Math.min(...words.map((w) => w.conf == null ? 1 : w.conf)) : 1;
+      // 자신 없게 들렸으면(기침, 다른 말 등) 채점하지 않고 다시 물어봐요
+      deliverHeard(listenFor, [text], true, conf < 0.5);
+    });
+    // 말하는 중간에도 들린 것을 받아서, 정답이면 더 빨리 채점해요
+    rec.on("partialresult", (m) => {
+      if (vMic.rec !== rec || !listenFor || listenFor.id !== id) return;
+      const partial = ((m.result || {}).partial || "").trim();
+      if (partial) deliverHeard(listenFor, [partial], false);
+    });
+    vMic.rec = rec;
+    vMic.forId = id;
+    setMic(true, listenFor.prompt);
   });
 }
 
-// 마이크 소리가 조금씩 들어올 때마다 불려요
-function onWhisperAudio(e) {
-  const data = new Float32Array(e.inputBuffer.getChannelData(0));
-  const sr = e.inputBuffer.sampleRate;
-  const ms = (data.length / sr) * 1000;
-  let sum = 0;
-  for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-  const rms = Math.sqrt(sum / data.length);
-  const loud = Math.max(0.02, wMic.floor * 3); // 이것보다 크면 "말소리"
-
-  if (!wMic.inSpeech) {
-    // 조용할 때의 소리 크기(배경 소음)를 천천히 배우기
-    if (rms < loud) wMic.floor = wMic.floor * 0.95 + rms * 0.05;
-    wMic.pre.push(data);
-    if (wMic.pre.length > 6) wMic.pre.shift(); // 말 시작 직전 소리도 조금 남겨 두기
-    if (wMic.armed && rms > loud) {
-      wMic.inSpeech = true;
-      wMic.chunks = wMic.pre.slice();
-      wMic.speechMs = 0;
-      wMic.silenceMs = 0;
-    }
-    return;
-  }
-  wMic.chunks.push(data);
-  wMic.speechMs += ms;
-  wMic.silenceMs = rms < loud * 0.6 ? wMic.silenceMs + ms : 0;
-  if (!wMic.armed) { wMic.inSpeech = false; return; }
-  if (wMic.silenceMs >= 700 || wMic.speechMs >= 5000) finishWhisperUtterance(sr);
-}
-
-// 말이 끝났어요 → 위스퍼에게 물어보기
-function finishWhisperUtterance(sr) {
-  wMic.inSpeech = false;
-  if (wMic.speechMs - wMic.silenceMs < 200) return; // 너무 짧은 소리(기침, 탁 소리)는 무시
-  const target = listenFor;
-  if (!target || target.id !== wMic.forId) return;
-  wMic.armed = false;
-  wMic.thinking = true;
-  setMic(false, "🧠 알아듣는 중…");
-  const audio = resampleTo16k(wMic.chunks, sr);
-  wMic.chunks = [];
-  whisperTranscribe(audio).then((res) => {
-    wMic.thinking = false;
-    let text = cleanWhisperText(res.text || "");
-    if (listenFor === target) {
-      if (text) deliverHeard(target, [text], true);
-      else setMic(true, target.prompt);
-    }
-    syncMic(); // 아직 답을 기다리면 다시 듣기
-  });
-}
-
-// 위스퍼가 조용한 소리를 듣고 지어내는 말("시청해 주셔서 감사합니다" 등)은 버리기
-function cleanWhisperText(text) {
-  const t = text.trim();
-  if (/감사합니다|시청|구독|좋아요|자막|MBC|KBS|SBS|뉴스/.test(t)) return "";
-  return t;
-}
-
-// 마이크 소리를 위스퍼가 원하는 모양(1초에 16000개)으로 바꾸기
-function resampleTo16k(chunks, sr) {
-  let len = 0;
-  chunks.forEach((c) => { len += c.length; });
-  const all = new Float32Array(len);
-  let o = 0;
-  chunks.forEach((c) => { all.set(c, o); o += c.length; });
-  if (sr === 16000) return all;
-  const ratio = sr / 16000;
-  const out = new Float32Array(Math.floor(len / ratio));
-  for (let i = 0; i < out.length; i++) {
-    const start = Math.floor(i * ratio), end = Math.min(len, Math.floor((i + 1) * ratio));
-    let s = 0;
-    for (let j = start; j < end; j++) s += all[j];
-    out[i] = s / Math.max(1, end - start);
-  }
-  return out;
-}
-
-if (speechEngine === "whisper") loadWhisper();
+if (speechEngine === "vosk") loadVosk();
 updateEngineUI();
 
 micSystemReady = true;
