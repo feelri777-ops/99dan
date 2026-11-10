@@ -449,6 +449,7 @@ function showQuestion() {
   $("message").textContent = "";
   $("message").className = "message";
   busy = false;
+  unclearCount = 0;
   questionStartTime = performance.now();
   clearTimeout(matchTimer);
   if (SpeechRecognition && !micBlocked) setMic(false, "준비…");
@@ -663,7 +664,13 @@ function learnStep() {
 
 function learnHeard(info) {
   if (!learnActive) return;
-  judge(info, learnDan * learnRow, learnRight, learnWrong);
+  const a = learnDan, b = learnRow;
+  // 외우기에서는 "칠이십사" 처럼 통째로 말해도, "십사" 만 말해도 맞아요
+  const chant = chantText(a, b).replace(/\s+/g, "");
+  judge(info, a * b, learnRight, learnWrong, () => {
+    setLearnMsg("🤔 잘 못 들었어요. 한 번 더 말해 볼래요?");
+    listen(learnHeard, learnStage === 1 || learnRevealed ? "🎤 따라 말해 보세요!" : "🎤 정답을 말해 보세요!");
+  }, [chant], { a, b });
 }
 
 // 맞게 말했어요 → 잠깐 칭찬하고 다음 줄로
@@ -856,7 +863,7 @@ function speak(text) {
           syncMic(); // 다 말했으면 마이크 켜기
         }
         resolve();
-      }, 250);
+      }, 200);
     };
     u.onend = finish;
     u.onerror = finish;
@@ -1018,13 +1025,16 @@ function handleSpeech(event) {
     heardTexts.forEach((t) => parseKoreanNumbers(t).forEach((n) => candidates.add(n)));
     const first = parseKoreanNumbers(heardTexts[0])[0];
 
-    target.handler({ candidates, isFinal: result.isFinal, first: first != null ? first : [...candidates][0] });
+    target.handler({ candidates, texts: heardTexts, isFinal: result.isFinal, first: first != null ? first : [...candidates][0] });
     if (listenFor !== target) return; // 채점이 끝났으면 그만
   }
 }
 
-// 들린 숫자 중에 정답이 있는지 보고 onRight / onWrong 을 불러 주는 도우미
-function judge(info, answer, onRight, onWrong) {
+// 들린 말을 채점하는 도우미
+//  - 정답 숫자가 그대로 들리면 → 바로 맞음
+//  - 아니면 "소리가 얼마나 비슷한지" 비교해서 맞음 / 틀림 / 잘 모르겠음 을 정해요
+//  extraTargets: 정답 말고도 맞다고 볼 소리 (예: 외우기 모드의 "칠이십사")
+function judge(info, answer, onRight, onWrong, onUnclear, extraTargets = [], q = null) {
   const id = listenFor && listenFor.id;
   if (info.candidates.has(answer)) {
     // 정답이 들렸어요! 말이 아직 이어지는 중일 수 있으니 아주 잠깐만 기다렸다가 채점
@@ -1035,8 +1045,147 @@ function judge(info, answer, onRight, onWrong) {
     return;
   }
   clearTimeout(matchTimer);
-  // 말이 끝났는데(최종 결과) 숫자가 정답이 아니면 → 틀림
-  if (info.isFinal && info.candidates.size > 0) onWrong(info.first);
+  if (!info.isFinal) return; // 말이 끝날 때까지 기다리기
+
+  const v = soundVerdict(info.texts, answer, extraTargets, q);
+  if (v.verdict === "right") onRight();
+  else if (v.verdict === "wrong") onWrong(v.number);
+  else if (v.verdict === "unclear" && onUnclear) onUnclear();
+}
+
+/* ----- 소리가 비슷한지 비교하기 -----
+   음성 인식은 아이 발음을 "오시뷰", "5 16", "오십 유" 처럼 엉뚱하게 받아 적기도 해요.
+   그래서 글자를 자음·모음으로 쪼갠 뒤, 정답 소리("오십육")와 얼마나 다른지 점수를 매겨요.
+   0 이면 똑같고, 1 에 가까울수록 많이 달라요. */
+const CHO_LIST = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
+const JUNG_LIST = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ";
+const JONG_LIST = ["", "ㄱ", "ㄱ", "ㄱ", "ㄴ", "ㄴ", "ㄴ", "ㄷ", "ㄹ", "ㄱ", "ㅁ", "ㄹ", "ㄹ", "ㄹ", "ㅂ", "ㄹ",
+                   "ㅁ", "ㅂ", "ㅂ", "ㄷ", "ㄷ", "ㅇ", "ㄷ", "ㄷ", "ㄱ", "ㄷ", "ㅂ", "ㄷ"]; // 받침은 소리 나는 대로
+// 비슷하게 들리는 소리 묶음
+const SOUND_GROUP = {
+  ㄱ: "K", ㄲ: "K", ㅋ: "K", ㄷ: "T", ㄸ: "T", ㅌ: "T", ㅂ: "P", ㅃ: "P", ㅍ: "P",
+  ㅅ: "S", ㅆ: "S", ㅈ: "J", ㅉ: "J", ㅊ: "J",
+  ㅐ: "E", ㅔ: "E", ㅒ: "YE", ㅖ: "YE", ㅙ: "WE", ㅚ: "WE", ㅞ: "WE",
+};
+const NATIVE_READ = ["", "하나", "둘", "셋", "넷", "다섯", "여섯", "일곱", "여덟", "아홉", "열"];
+
+// "오십육" → [ㅇ,ㅗ,ㅅ,ㅣ,ㅂ(받침),ㅇ,ㅠ,ㄱ(받침)]
+function toJamo(word) {
+  const out = [];
+  for (const ch of word) {
+    const code = ch.charCodeAt(0) - 0xac00;
+    if (code < 0 || code > 11171) continue;
+    out.push({ j: CHO_LIST[Math.floor(code / 588)], kind: "c" });
+    out.push({ j: JUNG_LIST[Math.floor((code % 588) / 28)], kind: "v" });
+    const jong = JONG_LIST[code % 28];
+    if (jong) out.push({ j: jong, kind: "f" });
+  }
+  return out;
+}
+
+function swapCost(a, b) {
+  if (a.j === b.j) return 0;
+  if ((a.kind === "v") !== (b.kind === "v")) return 1.5;       // 자음 ↔ 모음
+  if (SOUND_GROUP[a.j] && SOUND_GROUP[a.j] === SOUND_GROUP[b.j]) return 0.3; // ㅂ/ㅍ 처럼 비슷한 소리
+  return 1;
+}
+function dropCost(t) {
+  if (t.kind === "c" && t.j === "ㅇ") return 0.2; // 소리 없는 ㅇ
+  if (t.kind === "f" || t.j === "ㅎ") return 0.5; // 받침, ㅎ 은 잘 안 들려요
+  return 1;
+}
+// 두 소리가 얼마나 다른지 (0 = 똑같음)
+function soundDistance(a, b) {
+  const A = toJamo(a), B = toJamo(b);
+  if (!A.length || !B.length) return 1;
+  const d = Array.from({ length: A.length + 1 }, () => new Array(B.length + 1).fill(0));
+  for (let i = 1; i <= A.length; i++) d[i][0] = d[i - 1][0] + dropCost(A[i - 1]);
+  for (let j = 1; j <= B.length; j++) d[0][j] = d[0][j - 1] + dropCost(B[j - 1]);
+  for (let i = 1; i <= A.length; i++) {
+    for (let j = 1; j <= B.length; j++) {
+      d[i][j] = Math.min(
+        d[i - 1][j] + dropCost(A[i - 1]),
+        d[i][j - 1] + dropCost(B[j - 1]),
+        d[i - 1][j - 1] + swapCost(A[i - 1], B[j - 1]),
+      );
+    }
+  }
+  return d[A.length][B.length] / Math.max(A.length, B.length);
+}
+
+// 들린 말을 "읽는 소리"로 바꾸기: "5 16이요" → "오십육이요"
+function toReading(text) {
+  return text
+    .replace(/\d+/g, (num) => (num.length <= 3 ? toSino(Number(num)) : num))
+    .replace(/[^가-힣]/g, "");
+}
+
+// 앞뒤에 붙은 말을 떼어 본 여러 모양 ("정답은 오십육이요" → "오십육" 등)
+function readingVariants(reading, q) {
+  const set = new Set([reading]);
+  const ends = ["입니다", "이에요", "예요", "이요", "이야", "요", "야", "이다", "다"];
+  const starts = ["정답은", "답은", "음", "어", "으"];
+  [...set].forEach((r) => ends.forEach((e) => { if (r.endsWith(e) && r.length > e.length) set.add(r.slice(0, -e.length)); }));
+  [...set].forEach((r) => starts.forEach((st) => { if (r.startsWith(st) && r.length > st.length) set.add(r.slice(st.length)); }));
+  // 문제까지 같이 말한 경우 끝부분만 떼어 보기 ("칠 팔 오십육" → "오십육")
+  // 단, 앞부분에 문제 숫자(칠, 팔)가 들어 있을 때만! ("오십육" 에서 "육"만 떼면 안 되니까)
+  if (q) {
+    const qa = toSino(q.a), qb = toSino(q.b);
+    [...set].forEach((r) => {
+      for (let k = 1; k < r.length && k <= 4; k++) {
+        const head = r.slice(0, -k);
+        const ia = head.indexOf(qa);
+        if (ia >= 0 && head.indexOf(qb, ia + qa.length) >= 0) set.add(r.slice(-k));
+      }
+    });
+  }
+  return [...set].filter(Boolean);
+}
+
+// 들린 말들(후보 여러 개)을 보고 맞음 / 틀림 / 잘 모르겠음 정하기
+function soundVerdict(texts, answer, extraTargets = [], q = null) {
+  const targets = [toSino(answer), ...extraTargets];
+  if (answer <= 10) targets.push(NATIVE_READ[answer]);
+
+  let bestAns = 1;                       // 정답 소리와 가장 가까운 정도
+  let bestOther = { d: 1, n: null };     // 다른 숫자 소리와 가장 가까운 정도
+  let exactWrong = null;                 // 숫자로 똑똑히 들린 다른 답
+  texts.forEach((text, idx) => {
+    const reading = toReading(text);
+    if (!reading) return;
+    const variants = readingVariants(reading, q);
+    variants.forEach((v) => targets.forEach((t) => {
+      // 끝부분만 떼어 본 짧은 모양은 정답과 길이가 비슷할 때만 비교
+      if (v !== reading && Math.abs(v.length - t.length) > 1) return;
+      bestAns = Math.min(bestAns, soundDistance(v, t));
+    }));
+    if (idx === 0) {
+      const nums = parseKoreanNumbers(text).filter((n) => n !== answer && n >= 1 && n <= 90);
+      // 숫자로 들린 다른 답 (들린 말 대부분이 그 숫자일 때만. "안녕하세요"의 "세" 같은 건 빼기)
+      const clear = nums.find((n) => soundDistance(reading, toSino(n)) <= 0.5 ||
+        (n <= 10 && soundDistance(reading, NATIVE_READ[n]) <= 0.5));
+      if (clear != null) exactWrong = clear;
+      for (let n = 1; n <= 90; n++) {
+        if (n === answer) continue;
+        const t = toSino(n);
+        variants.forEach((v) => {
+          if (v !== reading && Math.abs(v.length - t.length) > 0) return;
+          const d = soundDistance(v, t);
+          // 더 비슷한 숫자, 똑같이 비슷하면 더 긴 숫자 고르기 ("십오" 가 "오" 보다 우선)
+          if (d < bestOther.d || (d === bestOther.d && bestOther.n != null && t.length > toSino(bestOther.n).length)) bestOther = { d, n };
+        });
+      }
+    }
+  });
+
+  // 정답 소리와 충분히 비슷하고, 다른 숫자보다 더 비슷하면 → 맞음 (애매하면 아이 편!)
+  if (bestAns <= 0.35 && bestAns <= bestOther.d + 0.05) return { verdict: "right" };
+  // 다른 숫자가 분명하게 들렸으면 → 틀림
+  if (bestOther.d <= 0.15 && bestOther.d < bestAns) return { verdict: "wrong", number: bestOther.n };
+  if (exactWrong != null && bestAns > 0.45) return { verdict: "wrong", number: exactWrong };
+  // 그 밖에는 잘 못 알아들은 것 → 다시 말해 달라고 하기
+  const anything = texts.some((t) => toReading(t).length > 0);
+  return { verdict: anything ? "unclear" : "silent" };
 }
 
 // 문제 풀기에서 들린 말 채점
@@ -1044,8 +1193,17 @@ function quizHeard(info) {
   if (busy || !playing) return;
   const q = questions[current];
   const answer = q.a * q.b;
-  judge(info, answer, () => submitAnswer(answer), (v) => submitAnswer(v));
+  judge(info, answer, () => submitAnswer(answer), (v) => submitAnswer(v), () => {
+    // 잘 못 알아들었어요 → 틀렸다고 하지 않고 다시 들어요
+    unclearCount++;
+    $("message").textContent = unclearCount >= 2
+      ? "🤔 잘 못 들었어요. 크게 또박또박! (숫자 버튼도 돼요)"
+      : "🤔 잘 못 들었어요. 다시 말해 줄래요?";
+    $("message").className = "message";
+    listen(quizHeard, "듣고 있어요… 다시 말해 보세요!");
+  }, [], q);
 }
+let unclearCount = 0;
 
 micSystemReady = true;
 
